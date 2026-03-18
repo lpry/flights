@@ -6,6 +6,11 @@ Searches for return flights between two airports, with filtering on flight
 duration, trip length, and weekend inclusion. Outputs an HTML report with
 links to booking pages.
 
+Origin and destination accept:
+  - A single IATA airport code:  LHR
+  - A comma-separated list:      LHR,LGW,STN
+  - A 2-letter country code:     GB  (resolves to all airports in that country)
+
 Requires an Amadeus API key/secret (free at https://developers.amadeus.com).
 Set via CLI flags or environment variables AMADEUS_API_KEY / AMADEUS_API_SECRET.
 
@@ -14,10 +19,15 @@ Usage:
       --date-from 2026-06-01 --date-to 2026-06-30 \
       --min-days 5 --max-days 9 --require-weekend \
       --max-outbound-duration 12 --max-inbound-duration 12
+
+  # Search all UK airports to any New York area airport:
+  python search_flights.py --origin GB --destination JFK,EWR,LGA \
+      --date-from 2026-06-01 --date-to 2026-06-30
 """
 
 import argparse
 import html
+import itertools
 import os
 import sys
 import time
@@ -29,6 +39,7 @@ import requests
 
 AMADEUS_AUTH_URL = "https://api.amadeus.com/v1/security/oauth2/token"
 AMADEUS_FLIGHTS_URL = "https://api.amadeus.com/v2/shopping/flight-offers"
+AMADEUS_LOCATIONS_URL = "https://api.amadeus.com/v1/reference-data/locations"
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +141,59 @@ class AmadeusClient:
             return []
         return resp.json().get("data", [])
 
+    def airports_in_country(self, country_code: str) -> list[str]:
+        """Return IATA codes for all airports in a country."""
+        self._ensure_token()
+        codes: list[str] = []
+        # The API paginates; fetch up to a reasonable limit.
+        params = {
+            "subType": "AIRPORT",
+            "countryCode": country_code.upper(),
+            "page[limit]": 100,
+        }
+        resp = requests.get(
+            AMADEUS_LOCATIONS_URL,
+            params=params,
+            headers={"Authorization": f"Bearer {self.access_token}"},
+        )
+        if resp.status_code != 200:
+            print(f"Error looking up airports for country {country_code}: "
+                  f"{resp.status_code} {resp.text[:200]}", file=sys.stderr)
+            sys.exit(1)
+        for loc in resp.json().get("data", []):
+            iata = loc.get("iataCode")
+            if iata:
+                codes.append(iata)
+        if not codes:
+            print(f"No airports found for country code '{country_code}'.",
+                  file=sys.stderr)
+            sys.exit(1)
+        return sorted(set(codes))
+
+
+def resolve_location_spec(spec: str, client: AmadeusClient) -> list[str]:
+    """Resolve a location specifier to a list of IATA airport codes.
+
+    Accepted formats:
+      - 3-letter IATA code:           "LHR"
+      - Comma-separated IATA codes:   "LHR,LGW,STN"
+      - 2-letter ISO country code:    "GB"
+    """
+    spec = spec.strip().upper()
+    if "," in spec:
+        codes = [c.strip() for c in spec.split(",") if c.strip()]
+        # Expand any 2-letter country codes within the list.
+        result = []
+        for c in codes:
+            if len(c) == 2:
+                result.extend(client.airports_in_country(c))
+            else:
+                result.append(c)
+        return sorted(set(result))
+    if len(spec) == 2:
+        return client.airports_in_country(spec)
+    return [spec]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -195,12 +259,23 @@ def filter_offers(offers: list, max_outbound_hours, max_inbound_hours):
 # HTML report
 # ---------------------------------------------------------------------------
 
-def render_html(results: list, args) -> str:
-    origin = html.escape(args.origin)
-    dest = html.escape(args.destination)
+def offer_airports(offer: dict) -> tuple[str, str]:
+    """Extract the actual origin and destination IATA codes from an offer."""
+    outbound = offer["itineraries"][0]
+    origin = outbound["segments"][0]["departure"]["iataCode"]
+    destination = outbound["segments"][-1]["arrival"]["iataCode"]
+    return origin, destination
+
+
+def render_html(results: list, args, origin_codes: list[str],
+                dest_codes: list[str]) -> str:
+    origin_label = html.escape(args.origin.upper())
+    dest_label = html.escape(args.destination.upper())
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     filters_desc = []
+    filters_desc.append(f"From: {', '.join(origin_codes)}")
+    filters_desc.append(f"To: {', '.join(dest_codes)}")
     if args.max_outbound_duration:
         filters_desc.append(f"Max outbound: {args.max_outbound_duration}h")
     if args.max_inbound_duration:
@@ -215,6 +290,7 @@ def render_html(results: list, args) -> str:
         offer = r["offer"]
         dep_date = r["depart_date"]
         ret_date = r["return_date"]
+        act_origin, act_dest = offer_airports(offer)
         outbound = offer["itineraries"][0]
         inbound = offer["itineraries"][1]
         price = offer["price"]["total"]
@@ -226,14 +302,15 @@ def render_html(results: list, args) -> str:
         days = (ret_date - dep_date).days
         weekend = "Yes" if has_weekend(dep_date, ret_date) else "No"
 
-        google_link = booking_url(args.origin, args.destination, dep_date, ret_date)
-        sky_link = skyscanner_url(args.origin, args.destination, dep_date, ret_date)
+        google_link = booking_url(act_origin, act_dest, dep_date, ret_date)
+        sky_link = skyscanner_url(act_origin, act_dest, dep_date, ret_date)
 
         out_summary = html.escape(segment_summary(outbound["segments"]))
         in_summary = html.escape(segment_summary(inbound["segments"]))
 
         rows.append(f"""
         <tr>
+          <td>{act_origin}\u2192{act_dest}</td>
           <td>{dep_date.isoformat()}</td>
           <td>{ret_date.isoformat()}</td>
           <td>{days}d</td>
@@ -252,7 +329,7 @@ def render_html(results: list, args) -> str:
     no_results_msg = ""
     if not rows:
         no_results_msg = (
-            '<tr><td colspan="8" style="text-align:center;padding:2em;">'
+            '<tr><td colspan="9" style="text-align:center;padding:2em;">'
             "No flights found matching the filters.</td></tr>"
         )
 
@@ -260,7 +337,7 @@ def render_html(results: list, args) -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Flight Search: {origin} \u2192 {dest}</title>
+<title>Flight Search: {origin_label} \u2192 {dest_label}</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          margin: 2em; background: #f8f9fa; color: #212529; }}
@@ -280,13 +357,13 @@ def render_html(results: list, args) -> str:
 </style>
 </head>
 <body>
-<h1>Flights: {origin} &rarr; {dest}</h1>
+<h1>Flights: {origin_label} &rarr; {dest_label}</h1>
 <p class="meta">Generated {now} &mdash; {filters_html}</p>
 <table>
 <thead>
 <tr>
-  <th>Outbound</th><th>Return</th><th>Days</th><th>Weekend</th>
-  <th>Price</th><th>Outbound route</th><th>Inbound route</th><th>Book</th>
+  <th>Route</th><th>Outbound</th><th>Return</th><th>Days</th><th>Weekend</th>
+  <th>Price</th><th>Outbound flight</th><th>Inbound flight</th><th>Book</th>
 </tr>
 </thead>
 <tbody>
@@ -308,10 +385,15 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Single airport to single airport:
   %(prog)s --origin LHR --destination JFK \\
            --date-from 2026-06-01 --date-to 2026-06-30 \\
            --min-days 5 --max-days 9 --require-weekend \\
            --max-outbound-duration 12 --max-inbound-duration 12
+
+  # All airports in GB to a list of NYC airports:
+  %(prog)s --origin GB --destination JFK,EWR,LGA \\
+           --date-from 2026-06-01 --date-to 2026-06-30
 
   Credentials via environment:
     export AMADEUS_API_KEY=your_key
@@ -320,9 +402,11 @@ Examples:
     )
 
     p.add_argument("--origin", required=True,
-                   help="Origin airport IATA code (e.g. LHR)")
+                   help="Origin: IATA code (LHR), comma list (LHR,LGW), "
+                        "or 2-letter country (GB)")
     p.add_argument("--destination", required=True,
-                   help="Destination airport IATA code (e.g. JFK)")
+                   help="Destination: IATA code (JFK), comma list (JFK,EWR), "
+                        "or 2-letter country (US)")
 
     p.add_argument("--date-from", required=True, type=date.fromisoformat,
                    help="Start of outbound date range (YYYY-MM-DD)")
@@ -372,10 +456,13 @@ def main(argv=None):
         print("  Sign up free at https://developers.amadeus.com", file=sys.stderr)
         sys.exit(1)
 
-    args.origin = args.origin.upper()
-    args.destination = args.destination.upper()
-
     client = AmadeusClient(api_key, api_secret)
+
+    # Resolve origins and destinations.
+    origin_codes = resolve_location_spec(args.origin, client)
+    dest_codes = resolve_location_spec(args.destination, client)
+    print(f"Origins:      {', '.join(origin_codes)}")
+    print(f"Destinations: {', '.join(dest_codes)}")
 
     # Build the list of (outbound_date, return_date) pairs to query.
     date_pairs: set[tuple[date, date]] = set()
@@ -387,35 +474,43 @@ def main(argv=None):
             date_pairs.add((dep, ret))
 
     sorted_pairs = sorted(date_pairs)
-    print(f"Searching {len(sorted_pairs)} date combinations for "
-          f"{args.origin} \u2192 {args.destination} \u2026")
+    route_pairs = list(itertools.product(origin_codes, dest_codes))
+    total_queries = len(sorted_pairs) * len(route_pairs)
+    print(f"Searching {len(sorted_pairs)} date(s) \u00d7 "
+          f"{len(route_pairs)} route(s) = {total_queries} queries \u2026")
 
     all_results = []
-    for i, (dep, ret) in enumerate(sorted_pairs, 1):
-        print(f"  [{i}/{len(sorted_pairs)}] {dep} \u2192 {ret} \u2026",
-              end=" ", flush=True)
-        offers = client.search_flights(
-            args.origin, args.destination, dep, ret,
-            max_results=args.max_results_per_query,
-            currency=args.currency,
-        )
-        offers = filter_offers(offers,
-                               args.max_outbound_duration,
-                               args.max_inbound_duration)
-        print(f"{len(offers)} offers")
-        for offer in offers:
-            all_results.append({
-                "offer": offer,
-                "depart_date": dep,
-                "return_date": ret,
-            })
+    query_num = 0
+    for orig, dest in route_pairs:
+        for dep, ret in sorted_pairs:
+            query_num += 1
+            print(f"  [{query_num}/{total_queries}] "
+                  f"{orig}\u2192{dest} {dep}\u2192{ret} \u2026",
+                  end=" ", flush=True)
+            offers = client.search_flights(
+                orig, dest, dep, ret,
+                max_results=args.max_results_per_query,
+                currency=args.currency,
+            )
+            offers = filter_offers(offers,
+                                   args.max_outbound_duration,
+                                   args.max_inbound_duration)
+            print(f"{len(offers)} offers")
+            for offer in offers:
+                all_results.append({
+                    "offer": offer,
+                    "depart_date": dep,
+                    "return_date": ret,
+                })
 
     all_results.sort(key=lambda r: float(r["offer"]["price"]["total"]))
 
     print(f"\nTotal matching offers: {len(all_results)}")
 
-    html_content = render_html(all_results, args)
-    output_path = args.output or f"flights_{args.origin}_{args.destination}.html"
+    html_content = render_html(all_results, args, origin_codes, dest_codes)
+    origin_tag = args.origin.upper().replace(",", "-")
+    dest_tag = args.destination.upper().replace(",", "-")
+    output_path = args.output or f"flights_{origin_tag}_{dest_tag}.html"
     Path(output_path).write_text(html_content, encoding="utf-8")
     print(f"Report written to {output_path}")
 
